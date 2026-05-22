@@ -1,11 +1,11 @@
 # Podcast This
 
-Convert documents from a markdown source directory into narrated podcast episodes. CLI on a home server runs the pipeline (LLM rewrite → local TTS → mp3 + RSS feed); a phone consumes the feed via any podcast app (Overcast, Apple Podcasts, Spotify, etc.).
+Convert documents from any source (markdown today; HTML pages, blogs, and PDFs later) into narrated podcast episodes. CLI on a home server runs the pipeline (source adapter → LLM rewrite → local TTS → mp3 + RSS feed); a phone consumes the feed via any podcast app (Overcast, Apple Podcasts, Spotify, etc.).
 
 Designed as the first mini-app of [`../bridge/`](../bridge/). Standalone CLI works without Bridge too.
 
 > **Project type:** Personal infra. Open-source target — released once pipeline + Bridge integration stabilize. Until then, internal-only.
-> **Source content:** any directory of markdown docs (config-driven; default in `./content/`, override per-invocation).
+> **Source content:** any document source via a pluggable adapter — `MarkdownSource` for MVP; `HTMLSource` / `PDFSource` / `RSSBlogSource` / `DocxSource` as v1+ adapters.
 > **Hosting model:** CLI + audio + feed live on the home server; phone subscribes over Tailscale.
 > **Status:** pre-implementation. Scope locked, code not started.
 
@@ -21,13 +21,18 @@ The selection gesture ("convert this doc into an episode") happens once on the s
 
 ```
 ┌──────────────────┐
-│  Markdown source │
-│  directory       │
+│  Source URI      │  .md file / URL / .pdf / .docx
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│  Source adapter  │  → normalized Document IR
+│  (BaseSource)    │     (title, sections[], metadata)
 └────────┬─────────┘
          │
          ▼
 ┌──────────────────┐     ┌──────────────────┐
-│  CLI on server   │ ──▶ │ LLM API          │  rewrite per H2 section
+│  CLI on server   │ ──▶ │ LLM API          │  rewrite per section
 │  podcast gen ... │     │ (Claude Opus)    │
 └────────┬─────────┘     └────────┬─────────┘
          │  spoken-form script    │
@@ -54,6 +59,7 @@ The selection gesture ("convert this doc into an episode") happens once on the s
 
 | Decision | Choice | Why |
 |---|---|---|
+| Source ingestion | Pluggable `BaseSource` adapters; `MarkdownSource` for MVP, `HTMLSource` / `PDFSource` / etc. as v1+ | Future-proofs the pipeline; new formats are adapters, not refactors |
 | Selection workflow | CLI on server, RSS feed → phone | Skips native app; podcast apps handle queue, state, sync |
 | Episode granularity | 1 H1 doc = 1 episode, H2s = chapter markers | Clean feed; chapters render as skip points in app |
 | Narration style | Single narrator, faithful rewrite | Two-host dialogue flattens technical content |
@@ -66,8 +72,8 @@ The selection gesture ("convert this doc into an episode") happens once on the s
 
 ## 4. Pipeline
 
-1. **Input:** `podcast gen <path/to/doc.md>` on the server.
-2. **Parse:** split markdown by `##` headings. Track section titles + offsets.
+1. **Input:** `podcast gen <uri>` on the server (file path, URL, etc.).
+2. **Source load:** the matching `BaseSource` adapter loads the URI and normalizes it into a `Document(title, sections[], metadata)` IR. For markdown, sections split by `##`. For HTML, readability + heuristic section detection. For unstructured PDFs, LLM-assisted section detection.
 3. **Rewrite:** for each section, call the LLM with `prompts/rewrite-section.md`. Outputs spoken-form text.
 4. **Stitch script:** assemble sections with a title intro + spoken transitions ("Section 3: backpropagation in matrix form.").
 5. **TTS:** synthesize each section to wav.
@@ -92,7 +98,8 @@ This prompt is where podcast quality lives. Iterate on one section before runnin
 
 ## 6. MVP scope (v0)
 
-- CLI: `podcast gen <path>` on a single markdown file.
+- CLI: `podcast gen <uri>` on a single source. MVP implements `MarkdownSource` only.
+- `BaseSource` abstraction + `Document` IR land in MVP so future format support is adapters, not refactors.
 - Output: one mp3 written to `audio/`.
 - Feed: hand-maintained `feed.xml` initially, to validate end-to-end.
 - TTS: F5-TTS, fixed default voice.
@@ -103,6 +110,10 @@ This prompt is where podcast quality lives. Iterate on one section before runnin
 | Feature | When |
 |---|---|
 | Folder-level batch (`podcast gen path/to/dir/`) | After single-file works |
+| `HTMLSource` adapter — websites and blog posts via readability extraction | v1 |
+| `DocxSource` adapter — pandoc-fronted `MarkdownSource` | v1 |
+| `PDFSource` adapter — `pdftotext` + LLM-assisted section extraction | v1 (PDF structure detection is its own subproblem) |
+| `RSSBlogSource` — subscribe to a blog's RSS, auto-generate episode per new post | v1.5 |
 | Auto-feed updates (CLI mutates `feed.xml`) | v0.5 |
 | Bridge mini-app integration: phone-triggered generation | After [`../bridge/`](../bridge/) MVP |
 | Bridge mini-app integration: LLM agent triggers generation via MCP | After Bridge MCP layer works |
@@ -119,8 +130,12 @@ podcast-this/
 ├── cli/
 │   ├── podcast/
 │   │   ├── main.py          CLI entry (typer)
-│   │   ├── parse.py         markdown → sections
-│   │   ├── rewrite.py       LLM API rewrite
+│   │   ├── sources/         BaseSource + adapters
+│   │   │   ├── base.py      BaseSource, Document, Section IR
+│   │   │   ├── markdown.py  MarkdownSource (MVP)
+│   │   │   ├── html.py      HTMLSource (v1+)
+│   │   │   └── pdf.py       PDFSource (v1+)
+│   │   ├── rewrite.py       LLM API rewrite (operates on Document IR)
 │   │   ├── tts.py           F5-TTS wrapper
 │   │   ├── stitch.py        wav concat + mp3 encode + chapters
 │   │   └── feed.py          RSS feed mutation
@@ -138,7 +153,41 @@ podcast-this/
 
 ## 9. Pluggability
 
-Two layers of the pipeline are swap points behind a base class. The rest of the pipeline doesn't know which backend is in use.
+Three layers of the pipeline are swap points behind a base class. The rest of the pipeline doesn't know which adapter or backend is in use.
+
+### Source ingestion
+
+```python
+@dataclass
+class Section:
+    heading: str
+    depth: int          # 1 for H1, 2 for H2, etc.
+    blocks: list[Block] # paragraph | code | table | math | quote | image
+
+@dataclass
+class Document:
+    title: str
+    source_uri: str
+    sections: list[Section]
+    metadata: dict      # author, pub_date, source_type, ...
+
+class BaseSource(ABC):
+    @abstractmethod
+    def supports(self, uri: str) -> bool: ...
+
+    @abstractmethod
+    def load(self, uri: str) -> Document: ...
+```
+
+| Source | Class | Notes |
+|---|---|---|
+| Markdown file | `MarkdownSource` | MVP. Deterministic parse, H2 = section. |
+| HTML page / blog post | `HTMLSource` | Readability + trafilatura for content extraction, heuristic section detection. |
+| RSS-subscribed blog | `RSSBlogSource` | Wraps `HTMLSource`; new post → new episode auto-generated. |
+| PDF | `PDFSource` | `pdftotext -layout` for text + LLM-assisted section detection (PDFs lack structural markup). |
+| Docx / .doc | `DocxSource` | `pandoc → markdown → MarkdownSource`. |
+
+URI scheme picks the adapter: `*.md` → markdown, `https://*` → HTML, `*.pdf` → PDF, etc. The downstream pipeline operates on the normalized `Document` IR.
 
 ### TTS backends
 
@@ -178,9 +227,14 @@ Config picks one of each at runtime.
 ## 10. Practical commands
 
 ```bash
-# Generate one episode
+# Generate one episode (MVP: markdown only)
 cd ~/Documents/podcast-this
 uv run podcast gen path/to/doc.md
+
+# v1+ source targets (adapters not yet implemented)
+# uv run podcast gen https://blog.example.com/post
+# uv run podcast gen path/to/paper.pdf
+# uv run podcast gen path/to/report.docx
 
 # Serve feed + audio locally
 caddy run --config server/Caddyfile

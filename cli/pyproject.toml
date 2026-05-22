@@ -1,0 +1,23 @@
+[project]
+name = "podcast-this"
+version = "0.0.1"
+description = "Convert documents from any source into narrated podcast episodes."
+readme = "../README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "saarang" }]
+dependencies = [
+    "openai>=1.40",
+]
+
+[project.optional-dependencies]
+f5 = ["f5-tts", "numpy>=1.24"]
+kokoro = ["kokoro>=0.7", "numpy>=1.24"]
+all = ["f5-tts", "kokoro>=0.7", "numpy>=1.24"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["podcast"]

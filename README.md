@@ -7,7 +7,7 @@ Designed as the first mini-app of [`../bridge/`](../bridge/). Standalone CLI wor
 > **Project type:** Personal infra. Open-source target — released once pipeline + Bridge integration stabilize. Until then, internal-only.
 > **Source content:** any document source via a pluggable adapter — `MarkdownSource` for MVP; `HTMLSource` / `PDFSource` / `RSSBlogSource` / `DocxSource` as v1+ adapters.
 > **Hosting model:** CLI + audio + feed live on the home server; phone subscribes over Tailscale.
-> **Status:** pre-implementation. Scope locked, code not started.
+> **Status:** TTS module implemented (`cli/podcast/tts/`); source adapters, rewriter, stitcher, and feed-writer pre-implementation.
 
 ---
 
@@ -65,7 +65,7 @@ The selection gesture ("convert this doc into an episode") happens once on the s
 | Narration style | Single narrator, faithful rewrite | Two-host dialogue flattens technical content |
 | Length cap | None | Podcast apps handle long-form fine; skip via chapters |
 | LLM for rewrite | Claude API (Opus, section-by-section) | Best quality for technical narration |
-| TTS | F5-TTS local (GPU-backed) | Quality near hosted APIs, no per-character cost, voice cloning option |
+| TTS | Pluggable `BaseTTS`; `OpenAITTS` for immediate bring-up, `F5TTS` once a reference voice is configured | OpenAI is hosted (no install) for fast iteration; F5-TTS is local + no per-character cost + voice cloning |
 | Audio format | MP3 with ID3v2 CHAP frames | Universal podcast app support |
 | Hosting | Local server + Caddy + Tailscale | Private, owned |
 | Feed | RSS 2.0 + iTunes namespace | Compatible with every podcast app |
@@ -102,7 +102,7 @@ This prompt is where podcast quality lives. Iterate on one section before runnin
 - `BaseSource` abstraction + `Document` IR land in MVP so future format support is adapters, not refactors.
 - Output: one mp3 written to `audio/`.
 - Feed: hand-maintained `feed.xml` initially, to validate end-to-end.
-- TTS: F5-TTS, fixed default voice.
+- TTS: `BaseTTS` interface + 3 backends — `OpenAITTS` (hosted, no extra install), `F5TTS` and `KokoroTTS` (local, behind optional `[f5]` / `[kokoro]` extras). Config selects one at runtime.
 - Hosting: Caddy serves `audio/` + `feed.xml` over Tailscale.
 
 ## 7. Deferred to v1+
@@ -136,7 +136,12 @@ podcast-this/
 │   │   │   ├── html.py      HTMLSource (v1+)
 │   │   │   └── pdf.py       PDFSource (v1+)
 │   │   ├── rewrite.py       LLM API rewrite (operates on Document IR)
-│   │   ├── tts.py           F5-TTS wrapper
+│   │   ├── tts/             BaseTTS + backends (implemented)
+│   │   │   ├── base.py      BaseTTS, Voice, SAMPLE_RATE
+│   │   │   ├── _util.py     text chunking, wav concat, samples→wav
+│   │   │   ├── openai.py    OpenAITTS — hosted, no extra install
+│   │   │   ├── f5.py        F5TTS — local, voice cloning
+│   │   │   └── kokoro.py    KokoroTTS — local, lightweight
 │   │   ├── stitch.py        wav concat + mp3 encode + chapters
 │   │   └── feed.py          RSS feed mutation
 │   └── pyproject.toml

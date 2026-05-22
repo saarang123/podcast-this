@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+
+# uv
+.uv-cache/
+
+# Generated audio (large, regenerable)
+audio/
+*.wav
+*.mp3
+!.gitkeep
+
+# Generated feed (regenerable from audio + metadata)
+feed/feed.xml
+
+# macOS
+.DS_Store
+
+# Local config (user-specific source paths, secrets)
+.local/
+CLAUDE.local.md

@@ -1,3 +1,3 @@
-"""podcast-this — convert documents into narrated podcast episodes."""
+"""podcast-this — convert documents into narrated podcast episodes via Spindle."""
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"

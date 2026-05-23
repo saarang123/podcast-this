@@ -1,19 +1,25 @@
 [project]
 name = "podcast-this"
-version = "0.0.1"
-description = "Convert documents from any source into narrated podcast episodes."
+version = "0.1.0"
+description = "Convert documents into narrated podcast episodes via Spindle."
 readme = "../README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "saarang" }]
 dependencies = [
-    "openai>=1.40",
+    "httpx>=0.27",
+    "typer>=0.12",
+    "mutagen>=1.47",   # ID3v2 chapter markers
 ]
 
 [project.optional-dependencies]
-f5 = ["f5-tts", "numpy>=1.24"]
-kokoro = ["kokoro>=0.7", "numpy>=1.24"]
-all = ["f5-tts", "kokoro>=0.7", "numpy>=1.24"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+podcast = "podcast.main:cli"
 
 [build-system]
 requires = ["hatchling"]

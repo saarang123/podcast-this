@@ -15,6 +15,13 @@ audio/
 *.mp3
 !.gitkeep
 
+# Per-run scratch (rewrite IO etc.)
+work/
+
+# Local test inputs you don't want committed
+test-input.md
+*.test.md
+
 # Generated feed (regenerable from audio + metadata)
 feed/feed.xml
 

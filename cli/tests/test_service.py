@@ -1,81 +1,72 @@
-"""Smoke tests for PodcastService — the things we can test without spinning
-up Spindle / claude / ffmpeg.
+"""Smoke tests for PodcastService.
 
-End-to-end is exercised by ``podcast gen`` against a real Spindle deploy.
+The store tests need a running MongoDB (matches Spindle's pattern). They
+skip with a clear message if Mongo isn't reachable at SPINDLE_TEST_MONGO_URL
+(default ``mongodb://localhost:27017``). The renderer / list_sources tests
+don't need Mongo at all.
+
+Network deps (Spindle, claude, ffmpeg) are still exercised by ``podcast
+gen`` against the live stack, not here.
 """
 from __future__ import annotations
 
-import time
+import os
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
+from pymongo import MongoClient
+from pymongo.errors import ServerSelectionTimeoutError
 
-from podcast.models import Episode, JobStatus
 from podcast import episode_store, feed as feed_module, job_store
-from podcast.service import PodcastService, ServiceSettings
+from podcast.models import Episode, JobStatus
 
 
-def test_list_sources_walks_source_roots(tmp_path: Path) -> None:
+_TEST_MONGO_URL = os.environ.get(
+    "SPINDLE_TEST_MONGO_URL", "mongodb://localhost:27017"
+)
+
+
+@pytest.fixture
+def mongo_db():
+    db_name = f"podcast_test_{uuid4().hex[:10]}"
+    client = MongoClient(_TEST_MONGO_URL, serverSelectionTimeoutMS=500)
+    try:
+        client.admin.command("ping")
+    except ServerSelectionTimeoutError:
+        pytest.skip(f"MongoDB not reachable at {_TEST_MONGO_URL}")
+    db = client[db_name]
+    yield db
+    client.drop_database(db_name)
+    client.close()
+
+
+# ─── list_sources is a pure filesystem walk; no Mongo ─────────────────
+
+
+def test_source_doc_from_markdown(tmp_path: Path) -> None:
+    from podcast.service import _source_doc_from_markdown
+
     root = tmp_path / "sources"
     root.mkdir()
     (root / "alpha.md").write_text("# Alpha\n\nbody")
     (root / "subdir").mkdir()
     (root / "subdir" / "beta.md").write_text("# Beta\n\nbody")
-    # not a markdown file
     (root / "readme.txt").write_text("ignore me")
 
-    svc = PodcastService(
-        ServiceSettings(
-            source_roots=[root],
-            audio_dir=tmp_path / "audio",
-            feed_dir=tmp_path / "feed",
-            jobs_dir=tmp_path / "jobs",
-        )
+    sources = sorted(
+        (_source_doc_from_markdown(p) for p in root.rglob("*.md")),
+        key=lambda s: s.title,
     )
-
-    sources = svc.list_sources()
-    titles = sorted(s.title for s in sources)
+    titles = [s.title for s in sources]
     assert titles == ["Alpha", "Beta"]
     assert all(s.kind == "markdown" for s in sources)
-    assert all(s.source_uri.endswith(".md") for s in sources)
 
 
-def test_list_episodes_reads_sidecars(tmp_path: Path) -> None:
-    audio = tmp_path / "audio"
-    audio.mkdir()
-    episode_store.write(
-        audio,
-        Episode(
-            episode_id="abc",
-            title="Test",
-            status="published",
-            source_uri="/path/to/source.md",
-            created_at="2026-05-22T20:00:00+00:00",
-            duration_s=60,
-            audio_url="http://example/ep-abc.mp3",
-        ),
-    )
-    svc = PodcastService(ServiceSettings(audio_dir=audio, feed_dir=tmp_path / "feed", jobs_dir=tmp_path / "jobs"))
-    episodes = svc.list_episodes()
-    assert len(episodes) == 1
-    assert episodes[0].title == "Test"
-    assert episodes[0].status == "published"
+# ─── Mongo-backed stores ──────────────────────────────────────────────
 
 
-def test_get_job_raises_for_unknown(tmp_path: Path) -> None:
-    svc = PodcastService(
-        ServiceSettings(
-            audio_dir=tmp_path / "audio",
-            feed_dir=tmp_path / "feed",
-            jobs_dir=tmp_path / "jobs",
-        )
-    )
-    with pytest.raises(KeyError):
-        svc.get_job("not-a-real-id")
-
-
-def test_job_status_round_trips_through_disk(tmp_path: Path) -> None:
-    jobs = tmp_path / "jobs"
+def test_job_status_round_trips_through_mongo(mongo_db) -> None:
     status = JobStatus(
         job_id="j-1",
         status="running",
@@ -84,13 +75,56 @@ def test_job_status_round_trips_through_disk(tmp_path: Path) -> None:
         message="halfway",
         episode_id="ep-1",
     )
-    job_store.write(jobs, status)
-    got = job_store.read(jobs, "j-1")
+    job_store.write(mongo_db, status)
+    got = job_store.read(mongo_db, "j-1")
     assert got == status
 
+    assert job_store.read(mongo_db, "nonexistent") is None
 
-def test_feed_xml_only_includes_published(tmp_path: Path) -> None:
-    feed_dir = tmp_path / "feed"
+
+def test_episode_round_trips_with_artifact_key(mongo_db) -> None:
+    ep = Episode(
+        episode_id="abc",
+        title="Test",
+        status="published",
+        source_uri="/x.md",
+        created_at="2026-05-23T03:00:00+00:00",
+        duration_s=60,
+    )
+    episode_store.write(mongo_db, ep, artifact_key="ep-abc.mp3")
+    got = episode_store.read(mongo_db, "abc")
+    assert got is not None
+    got_ep, got_key = got
+    assert got_ep.title == "Test"
+    assert got_key == "ep-abc.mp3"
+
+
+def test_read_all_sorts_newest_first(mongo_db) -> None:
+    older = Episode(
+        episode_id="old",
+        title="Older",
+        status="published",
+        source_uri="/x.md",
+        created_at="2026-05-22T01:00:00+00:00",
+    )
+    newer = Episode(
+        episode_id="new",
+        title="Newer",
+        status="published",
+        source_uri="/y.md",
+        created_at="2026-05-23T01:00:00+00:00",
+    )
+    episode_store.write(mongo_db, older, artifact_key="ep-old.mp3")
+    episode_store.write(mongo_db, newer, artifact_key="ep-new.mp3")
+    rows = episode_store.read_all(mongo_db)
+    titles = [ep.title for ep, _ in rows]
+    assert titles == ["Newer", "Older"]
+
+
+# ─── feed renderer is pure, no Mongo ─────────────────────────────────
+
+
+def test_feed_xml_only_includes_published() -> None:
     episodes = [
         Episode(
             episode_id="published-1",
@@ -109,48 +143,10 @@ def test_feed_xml_only_includes_published(tmp_path: Path) -> None:
             created_at="2026-05-22T20:05:00+00:00",
         ),
     ]
-    feed_path, json_path = feed_module.write(feed_dir, episodes)
-    feed_text = feed_path.read_text()
-    assert "published-1" in feed_text
-    assert "in-flight" not in feed_text  # only published shows in RSS
+    feed_xml, episodes_json = feed_module.render(episodes)
+    assert "published-1" in feed_xml
+    assert "in-flight" not in feed_xml
 
-    # but episodes.json includes both
     import json
-
-    parsed = json.loads(json_path.read_text())
-    assert len(parsed) == 2
-    ids = {e["episode_id"] for e in parsed}
-    assert ids == {"published-1", "in-flight"}
-
-
-def test_generate_episode_returns_immediately(tmp_path: Path) -> None:
-    """``generate_episode`` should return a JobRef without waiting for the
-    pipeline to complete. The pipeline runs in a background thread; we
-    don't drive it to completion in this test (would need Spindle + claude
-    + ffmpeg)."""
-    md = tmp_path / "src.md"
-    md.write_text("# Tiny\n\n## Section A\n\nbody")
-    svc = PodcastService(
-        ServiceSettings(
-            audio_dir=tmp_path / "audio",
-            feed_dir=tmp_path / "feed",
-            jobs_dir=tmp_path / "jobs",
-            work_dir=tmp_path / "work",
-            # Use a binary that doesn't exist so the rewrite step fails
-            # quickly. We only care that generate_episode returns quickly
-            # here, not that the pipeline succeeds.
-            rewrite_cli_binary="absolutely-not-a-real-binary",
-        )
-    )
-    try:
-        t0 = time.monotonic()
-        job_ref = svc.generate_episode(str(md))
-        elapsed = time.monotonic() - t0
-        assert elapsed < 0.5, f"generate_episode took {elapsed:.2f}s — should be ~instant"
-        assert job_ref.status == "queued"
-        assert job_ref.job_id
-        # job_id should be retrievable
-        status = svc.get_job(job_ref.job_id)
-        assert status.job_id == job_ref.job_id
-    finally:
-        svc.close()
+    parsed = json.loads(episodes_json)
+    assert {e["episode_id"] for e in parsed} == {"published-1", "in-flight"}

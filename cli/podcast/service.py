@@ -6,28 +6,31 @@ Spec:
     list_episodes()                             → list[Episode]
     get_job(job_id)                             → JobStatus
 
-``generate_episode`` returns immediately. Heavy work (claude rewrites,
-Spindle TTS, ffmpeg stitch) runs in a background thread with its own
-asyncio event loop. Job state is mirrored to disk so multiple processes /
-restarts can read the same view.
+State lives in MongoDB (``podcast_this.jobs`` + ``podcast_this.episodes``).
+MP3 bytes live in MinIO bucket ``podcast-episodes``. Nothing podcast-related
+is stored on local disk anymore — both stores survive process restarts and
+are queryable from multiple processes simultaneously.
+
+``generate_episode`` returns immediately; the heavy work (claude rewrites,
+Spindle TTS, ffmpeg stitch, MinIO upload) runs in a ThreadPoolExecutor
+worker thread.
 """
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import re
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 from uuid import uuid4
 
+from pymongo import MongoClient
+
 from . import episode_store, job_store
-from . import feed as feed_module
+from .artifact_store import MinIOArtifactStore
 from .models import Episode, JobRef, JobStatus, SourceDoc
 from .pipeline import PipelineConfig, generate_podcast
 from .sources.markdown import load_markdown
@@ -37,61 +40,62 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class ServiceSettings:
-    """How a PodcastService is configured. All paths default to local CWD."""
+    """How a PodcastService is configured."""
 
     # Directories to walk for ``list_sources``. Each entry is recursively
     # scanned for ``*.md`` files.
     source_roots: list[Path] = field(default_factory=list)
 
-    # Where to write produced MP3s + their per-episode JSON sidecars.
-    audio_dir: Path = Path("./audio")
-
-    # Where to write feed.xml + episodes.json.
-    feed_dir: Path = Path("./feed")
-
-    # Where to keep per-job status JSON.
-    jobs_dir: Path = Path("./jobs")
-
-    # Per-run scratch directory (rewrite IO, etc.).
+    # Per-run scratch directory (rewrite IO, intermediate stitch wav, etc.).
+    # Cleared after each successful generate_episode unless ``keep_work_dir``.
     work_dir: Path = Path("./work")
 
-    # URL prefix Caddy / Bridge serves the audio under. The episode's
-    # ``audio_url`` becomes ``{audio_url_base}/ep-<id>.mp3``.
-    audio_url_base: str = "http://localhost:8000/audio"
+    # MongoDB
+    mongo_url: str = "mongodb://localhost:27017"
+    mongo_db: str = "podcast_this"
 
-    # URL Caddy serves the feed at.
-    feed_url: str = "http://localhost:8000/feed/feed.xml"
+    # MinIO / S3 for the produced MP3 bytes
+    s3_endpoint: str = "http://localhost:9000"
+    s3_bucket: str = "podcast-episodes"
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    s3_region: str = "us-east-1"
+
+    # If set, used as the audio_url base instead of building it from
+    # ``s3_endpoint`` / ``s3_bucket``. Useful when Caddy fronts MinIO under
+    # a different hostname (e.g. ``http://homeserver.tailnet.ts.net/audio``).
+    audio_url_base_override: str | None = None
+
+    # URL where Caddy / MinIO serves the regenerated feed.xml.
+    feed_url: str = "http://localhost:9000/podcast-episodes/feed.xml"
 
     # Spindle API to submit TTS jobs to.
     spindle_url: str = "http://localhost:8080"
     spindle_auth_token: str | None = None
 
-    # Default TTS config_id; callers can override via per-call options later.
+    # Default TTS config_id.
     tts_config_id: str = "audio-tts-openai-v1"
     tts_voice: str | None = None
 
-    # Concurrency caps inside the pipeline.
+    # Pipeline concurrency caps.
     rewrite_concurrency: int = 5
     tts_concurrency: int = 5
 
-    # CLI binary name for rewrite subprocesses.
+    # CLI binary for the rewrite subprocess.
     rewrite_cli_binary: str = "claude"
 
-    # Bitrate for MP3 encoding.
+    # MP3 bitrate.
     mp3_bitrate: str = "64k"
 
-    # Podcast feed metadata (used in feed.xml).
+    # Podcast metadata (used by feed.xml).
     podcast_title: str = "Podcast This"
     podcast_description: str = "Auto-generated narrations of technical documents."
     podcast_author: str = "podcast-this"
 
 
 class PodcastService:
-    """The Python API Bridge (or any caller) wraps.
-
-    Instantiate once per host process. Background episode generation runs
-    in a ThreadPoolExecutor that lives for the lifetime of the service.
-    """
+    """Public API. Instantiate once per host process. Background pipeline
+    runs in a ThreadPoolExecutor that lives until ``close()``."""
 
     def __init__(
         self,
@@ -107,14 +111,21 @@ class PodcastService:
         self._jobs_lock = threading.Lock()
         self._jobs: dict[str, JobStatus] = {}
 
-        # Make sure target dirs exist so callers don't trip on first call.
-        for d in (
-            self.settings.audio_dir,
-            self.settings.feed_dir,
-            self.settings.jobs_dir,
-            self.settings.work_dir,
-        ):
-            Path(d).mkdir(parents=True, exist_ok=True)
+        self._mongo = MongoClient(self.settings.mongo_url)
+        self._db = self._mongo[self.settings.mongo_db]
+        job_store.ensure_indexes(self._db)
+        episode_store.ensure_indexes(self._db)
+
+        self._artifacts = MinIOArtifactStore(
+            endpoint_url=self.settings.s3_endpoint,
+            bucket=self.settings.s3_bucket,
+            access_key=self.settings.s3_access_key,
+            secret_key=self.settings.s3_secret_key,
+            region=self.settings.s3_region,
+        )
+        self._artifacts.ensure_bucket()
+
+        Path(self.settings.work_dir).mkdir(parents=True, exist_ok=True)
 
     # ─── public API ──────────────────────────────────────────────────
 
@@ -141,38 +152,41 @@ class PodcastService:
         )
         self._save_status(status)
 
-        # Submit to thread pool — `_run_pipeline_sync` boots its own
-        # asyncio event loop so the caller doesn't have to be async.
         self._executor.submit(
             self._run_pipeline_sync, job_id, episode_id, source_uri
         )
-
         return JobRef(job_id=job_id, status="queued")
 
     def list_episodes(self) -> list[Episode]:
-        return episode_store.read_all(Path(self.settings.audio_dir))
+        out: list[Episode] = []
+        for ep, key in episode_store.read_all(self._db):
+            audio_url = self._audio_url_for(key) if key else None
+            out.append(replace(ep, audio_url=audio_url))
+        return out
 
     def get_job(self, job_id: str) -> JobStatus:
         with self._jobs_lock:
             cached = self._jobs.get(job_id)
         if cached is not None:
             return cached
-        on_disk = job_store.read(Path(self.settings.jobs_dir), job_id)
+        on_disk = job_store.read(self._db, job_id)
         if on_disk is None:
             raise KeyError(f"unknown job_id: {job_id}")
         return on_disk
 
     def close(self) -> None:
-        """Shut the thread pool down. New ``generate_episode`` calls fail
-        after this; in-flight jobs finish."""
+        """Stop accepting new generations; let in-flight jobs finish."""
         self._executor.shutdown(wait=False, cancel_futures=False)
+        try:
+            self._mongo.close()
+        except Exception:
+            pass
 
     # ─── background execution ────────────────────────────────────────
 
     def _run_pipeline_sync(
         self, job_id: str, episode_id: str, source_uri: str
     ) -> None:
-        """Run the async pipeline in this worker thread."""
         try:
             asyncio.run(self._run_pipeline(job_id, episode_id, source_uri))
         except Exception as e:
@@ -192,8 +206,6 @@ class PodcastService:
             job_id, status="running", phase="loading", progress=0.05
         )
 
-        # Pre-load the source so we can extract the title for the episode
-        # record before the long-running rewrite/TTS work starts.
         try:
             source_path = Path(source_uri).expanduser()
             doc = load_markdown(source_path)
@@ -205,29 +217,30 @@ class PodcastService:
 
         title = doc.title
         created_at = datetime.now(UTC).isoformat()
-        slug = _slugify(title) or episode_id
 
-        # Drop a "generating" episode sidecar so list_episodes shows in-flight
-        # work immediately.
-        episode = Episode(
+        # Drop a "generating" episode record so list_episodes shows in-flight
+        # work immediately (audio_url is None until publish).
+        generating_episode = Episode(
             episode_id=episode_id,
             title=title,
             status="generating",
             source_uri=str(source_path),
             created_at=created_at,
         )
-        episode_store.write(Path(self.settings.audio_dir), episode)
+        episode_store.write(self._db, generating_episode)
 
         self._update_status(
             job_id, phase="rewriting", progress=0.1, episode_id=episode_id
         )
 
+        # Pipeline writes the MP3 to a temp path under work_dir; we then
+        # upload to MinIO and delete the local file.
         cfg = PipelineConfig(
             spindle_url=self.settings.spindle_url,
             spindle_auth_token=self.settings.spindle_auth_token,
             tts_config_id=self.settings.tts_config_id,
             tts_voice=self.settings.tts_voice,
-            audio_dir=Path(self.settings.audio_dir),
+            audio_dir=Path(self.settings.work_dir) / "mp3-tmp",
             work_dir=Path(self.settings.work_dir),
             mp3_bitrate=self.settings.mp3_bitrate,
             rewrite_concurrency=self.settings.rewrite_concurrency,
@@ -235,11 +248,6 @@ class PodcastService:
             cli_binary=self.settings.rewrite_cli_binary,
         )
 
-        # The current pipeline doesn't yet take a progress callback. We
-        # update phases at the boundaries we can see from out here
-        # (rewriting → tts → stitching → publishing) by reading the time
-        # the pipeline call has been running and the on-disk artifacts it
-        # writes. For v0 we update on coarse boundaries only.
         try:
             mp3_path = await asyncio.wait_for(
                 generate_podcast(str(source_path), cfg),
@@ -251,28 +259,32 @@ class PodcastService:
                 job_id, status="failed", phase="rewriting", message=str(e)
             )
             episode_store.write(
-                Path(self.settings.audio_dir),
-                replace(episode, status="failed"),
+                self._db, replace(generating_episode, status="failed")
             )
             return
 
-        # Move the MP3 into a stable, episode_id-keyed filename so the
-        # audio_url is deterministic.
-        stable_mp3 = Path(self.settings.audio_dir) / f"ep-{episode_id}.mp3"
+        # Read MP3 bytes, upload to MinIO under a stable key, delete temp.
+        mp3_bytes = mp3_path.read_bytes()
         try:
-            mp3_path.replace(stable_mp3)
-        except OSError:
-            # cross-device rename → fall back to copy
-            stable_mp3.write_bytes(mp3_path.read_bytes())
             mp3_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
-        duration_s = _peek_mp3_duration(stable_mp3)
-        audio_url = f"{self.settings.audio_url_base.rstrip('/')}/ep-{episode_id}.mp3"
-
-        # Publish: update episode sidecar + regenerate feed
-        self._update_status(
-            job_id, phase="publishing", progress=0.95
+        artifact_key = f"ep-{episode_id}.mp3"
+        self._update_status(job_id, phase="publishing", progress=0.95)
+        self._artifacts.put_mp3(
+            artifact_key,
+            mp3_bytes,
+            metadata={
+                "episode_id": episode_id,
+                "title": title[:200],  # S3 metadata is byte-limited
+                "source_uri": str(source_path)[:1000],
+            },
         )
+
+        duration_s = _peek_mp3_duration(mp3_bytes)
+        audio_url = self._audio_url_for(artifact_key)
+
         published_episode = Episode(
             episode_id=episode_id,
             title=title,
@@ -283,22 +295,18 @@ class PodcastService:
             audio_url=audio_url,
             feed_url=self.settings.feed_url,
         )
-        episode_store.write(Path(self.settings.audio_dir), published_episode)
-        feed_module.write(
-            Path(self.settings.feed_dir),
-            self.list_episodes(),
-            podcast_title=self.settings.podcast_title,
-            podcast_description=self.settings.podcast_description,
-            podcast_author=self.settings.podcast_author,
-            podcast_link=self.settings.audio_url_base,
-        )
+        episode_store.write(self._db, published_episode, artifact_key=artifact_key)
+
+        # Rebuild feed.xml + episodes.json from the current episode list,
+        # upload both to MinIO so Caddy / Overcast pick them up.
+        self._republish_feed()
 
         self._update_status(
             job_id,
             status="complete",
             phase="publishing",
             progress=1.0,
-            message=f"published {stable_mp3.name}",
+            message=f"published {artifact_key}",
             episode_id=episode_id,
             audio_url=audio_url,
             feed_url=self.settings.feed_url,
@@ -309,18 +317,43 @@ class PodcastService:
     def _save_status(self, status: JobStatus) -> None:
         with self._jobs_lock:
             self._jobs[status.job_id] = status
-        job_store.write(Path(self.settings.jobs_dir), status)
+        job_store.write(self._db, status)
 
     def _update_status(self, job_id: str, **changes) -> None:
         with self._jobs_lock:
             current = self._jobs.get(job_id)
         if current is None:
-            current = job_store.read(Path(self.settings.jobs_dir), job_id)
+            current = job_store.read(self._db, job_id)
         if current is None:
             log.warning("update_status for unknown job_id=%s", job_id)
             return
         new_status = replace(current, **changes)
         self._save_status(new_status)
+
+    # ─── URL building + feed regeneration ─────────────────────────────
+
+    def _audio_url_for(self, artifact_key: str) -> str:
+        if self.settings.audio_url_base_override:
+            base = self.settings.audio_url_base_override.rstrip("/")
+            return f"{base}/{artifact_key}"
+        return self._artifacts.url_for(artifact_key)
+
+    def _republish_feed(self) -> None:
+        from . import feed as feed_module
+
+        episodes = self.list_episodes()
+        feed_xml, episodes_json = feed_module.render(
+            episodes,
+            podcast_title=self.settings.podcast_title,
+            podcast_description=self.settings.podcast_description,
+            podcast_author=self.settings.podcast_author,
+            podcast_link=self.settings.audio_url_base_override
+            or self.settings.s3_endpoint,
+        )
+        self._artifacts.put_text("feed.xml", feed_xml, content_type="application/rss+xml")
+        self._artifacts.put_text(
+            "episodes.json", episodes_json, content_type="application/json"
+        )
 
 
 # ─── helpers ─────────────────────────────────────────────────────────
@@ -333,10 +366,7 @@ def _source_doc_from_markdown(path: Path) -> SourceDoc:
     except OSError:
         mtime = None
     return SourceDoc(
-        title=title,
-        source_uri=str(path),
-        kind="markdown",
-        updated_at=mtime,
+        title=title, source_uri=str(path), kind="markdown", updated_at=mtime
     )
 
 
@@ -347,7 +377,6 @@ def _first_h1(path: Path) -> str | None:
                 if line.startswith("# "):
                     return line[2:].strip()
                 if line.strip():
-                    # Non-empty, non-heading first line → no H1 in this doc.
                     break
     except OSError:
         return None
@@ -361,11 +390,21 @@ def _slugify(s: str) -> str:
     return _SLUG_RE.sub("-", s.lower()).strip("-")[:60]
 
 
-def _peek_mp3_duration(mp3_path: Path) -> int | None:
-    """Best-effort duration in seconds; returns None if we can't read."""
+def _peek_mp3_duration(mp3_bytes: bytes) -> int | None:
+    """Read duration without writing to disk. mutagen handles bytes via
+    a tiny BytesIO wrapper, but the simplest correct call is via a
+    temp file — same outcome, simpler code path."""
+    import tempfile
+
     try:
         from mutagen.mp3 import MP3
 
-        return int(MP3(str(mp3_path)).info.length)
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(mp3_bytes)
+            tmp = Path(f.name)
+        try:
+            return int(MP3(str(tmp)).info.length)
+        finally:
+            tmp.unlink(missing_ok=True)
     except Exception:
         return None

@@ -1,49 +1,48 @@
-"""Per-job status persisted to disk.
+"""Per-job status persisted to MongoDB.
 
-Keeps an on-disk record of each ``generate_episode`` job so:
-  - status survives process restarts
-  - Bridge can call ``get_job`` from a different worker / request than the
-    one that started the job
-  - in-flight jobs are recoverable when the process boots back up (v0
-    treats interrupted jobs as failed — Spindle's job state is still in
-    Mongo, but the orchestrator's `await` is lost on restart)
+Collection: ``{mongo_db}.jobs`` — one document per job, ``_id`` is the
+``job_id`` string. Schema mirrors the ``JobStatus`` dataclass exactly.
 
-One file per job at ``{jobs_dir}/{job_id}.json``. Reads + writes are
-atomic via temp-file + rename.
+Sync API (pymongo) because the calling pipeline runs in a background
+thread and Mongo writes are sub-millisecond — no benefit from an async
+client.
+
+Indexed on ``status`` so ``list_jobs(status=...)`` is cheap if we ever add
+that to the public API.
 """
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 from dataclasses import asdict
-from pathlib import Path
+
+from pymongo.collection import Collection
+from pymongo.database import Database
 
 from .models import JobStatus
 
 
-def write(jobs_dir: Path, status: JobStatus) -> None:
-    jobs_dir.mkdir(parents=True, exist_ok=True)
-    target = jobs_dir / f"{status.job_id}.json"
-    # atomic write via NamedTemporaryFile + os.replace
-    fd, tmp_path = tempfile.mkstemp(
-        suffix=".json", prefix=f".{status.job_id}.", dir=jobs_dir
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(asdict(status), f, indent=2)
-        os.replace(tmp_path, target)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
-            pass
-        raise
+_COLLECTION = "jobs"
 
 
-def read(jobs_dir: Path, job_id: str) -> JobStatus | None:
-    target = jobs_dir / f"{job_id}.json"
-    if not target.exists():
+def ensure_indexes(db: Database) -> None:
+    """Idempotent. Call once at PodcastService init."""
+    coll = db[_COLLECTION]
+    coll.create_index("status")
+    coll.create_index("episode_id")
+
+
+def _coll(db: Database) -> Collection:
+    return db[_COLLECTION]
+
+
+def write(db: Database, status: JobStatus) -> None:
+    doc = asdict(status)
+    doc["_id"] = status.job_id
+    _coll(db).replace_one({"_id": status.job_id}, doc, upsert=True)
+
+
+def read(db: Database, job_id: str) -> JobStatus | None:
+    doc = _coll(db).find_one({"_id": job_id})
+    if doc is None:
         return None
-    data = json.loads(target.read_text(encoding="utf-8"))
-    return JobStatus(**data)
+    doc.pop("_id", None)
+    return JobStatus(**doc)

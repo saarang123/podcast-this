@@ -1,45 +1,33 @@
-"""RSS 2.0 feed generation from the on-disk episode store.
+"""RSS 2.0 feed + episodes.json renderer.
 
-Regenerated whenever an episode publishes; written to
-``feed/feed.xml`` + ``feed/episodes.json``.
-
-Two outputs:
-  - ``feed.xml`` — what Overcast / Apple Podcasts / etc. subscribe to.
-    RSS 2.0 + iTunes namespace (the de-facto podcast standard).
-  - ``episodes.json`` — machine-readable list of the same data, for
-    Bridge or any other programmatic consumer.
+Pure rendering — given a list of Episodes, returns (feed_xml, episodes_json)
+as strings. The service uploads them to MinIO; previously this module wrote
+files to disk, which was retained when episodes lived in JSON sidecars.
 """
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from dataclasses import asdict
 from email.utils import format_datetime
-from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
 from .models import Episode
 
 
-def write(
-    feed_dir: Path,
+def render(
     episodes: list[Episode],
     *,
     podcast_title: str = "Podcast This",
     podcast_description: str = "Auto-generated narrations of technical documents.",
     podcast_author: str = "podcast-this",
     podcast_link: str = "http://localhost",
-) -> tuple[Path, Path]:
-    """Write feed.xml + episodes.json from the given episode list.
+) -> tuple[str, str]:
+    """Return (feed.xml, episodes.json).
 
-    Returns (feed_xml_path, episodes_json_path).
+    feed.xml contains only ``published`` episodes (Overcast doesn't want
+    half-finished entries). episodes.json contains everything so Bridge can
+    show in-flight runs too.
     """
-    feed_dir.mkdir(parents=True, exist_ok=True)
-
-    # Only published episodes go into the RSS feed (Overcast doesn't want
-    # half-finished episodes), but episodes.json includes everything so
-    # Bridge can show in-flight ones too.
     published = [e for e in episodes if e.status == "published"]
 
     feed_xml = _build_rss(
@@ -49,15 +37,8 @@ def write(
         podcast_author=podcast_author,
         podcast_link=podcast_link,
     )
-    feed_path = _atomic_write(feed_dir / "feed.xml", feed_xml)
-
-    episodes_json = json.dumps(
-        [asdict(e) for e in episodes],
-        indent=2,
-    )
-    json_path = _atomic_write(feed_dir / "episodes.json", episodes_json)
-
-    return feed_path, json_path
+    episodes_json = json.dumps([asdict(e) for e in episodes], indent=2)
+    return feed_xml, episodes_json
 
 
 def _build_rss(
@@ -95,14 +76,10 @@ def _build_rss(
 
 
 def _build_item(e: Episode) -> str:
-    import datetime as _dt
-
     pub_date = _to_rfc2822(e.created_at)
     audio_url = e.audio_url or ""
     duration_str = (
-        _format_itunes_duration(e.duration_s)
-        if e.duration_s is not None
-        else ""
+        _format_itunes_duration(e.duration_s) if e.duration_s is not None else ""
     )
     return f"""    <item>
       <title>{xml_escape(e.title)}</title>
@@ -118,7 +95,6 @@ def _to_rfc2822(iso_string: str) -> str:
     import datetime as _dt
 
     try:
-        # Python 3.11+ handles trailing Z
         dt = _dt.datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=_dt.UTC)
@@ -131,22 +107,3 @@ def _format_itunes_duration(seconds: int) -> str:
     hours, rem = divmod(seconds, 3600)
     minutes, secs = divmod(rem, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-
-def _atomic_write(target: Path, content: str) -> Path:
-    fd, tmp_path = tempfile.mkstemp(
-        suffix=target.suffix,
-        prefix=f".{target.name}.",
-        dir=target.parent,
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.replace(tmp_path, target)
-        return target
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
-            pass
-        raise

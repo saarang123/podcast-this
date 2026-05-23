@@ -18,6 +18,11 @@ audio/
 # Per-run scratch (rewrite IO etc.)
 work/
 
+# Pre-Mongo state directories — Mongo + MinIO now hold all metadata + bytes.
+# These only exist if the old JSON-backed code is still in use somewhere.
+jobs/
+feed/
+
 # Local test inputs you don't want committed
 test-input.md
 *.test.md

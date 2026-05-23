@@ -1,0 +1,24 @@
+# Caddy config to serve podcast-this's audio/ and feed/ over HTTP.
+#
+# Run with:
+#   cd ~/Documents/podcast-this
+#   caddy run --config server/Caddyfile
+#
+# Phone Overcast subscribes to:
+#   http://<this-host>:8000/feed/feed.xml
+#
+# Tailscale-only deployment: change the bind address to your Tailscale IP
+# (e.g. 100.x.y.z:8000) so the feed isn't exposed on your LAN at large.
+
+:8000 {
+    root * .
+    file_server browse
+
+    # Standard MIME types — Caddy picks audio/mpeg for .mp3 automatically.
+    # The browse directive gives a directory listing at /; remove it for
+    # a tighter deploy.
+
+    # CORS so a future Bridge web UI can fetch episodes.json from a
+    # different origin.
+    header /feed/* Access-Control-Allow-Origin "*"
+}
